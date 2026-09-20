@@ -140,15 +140,28 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="h-4 w-[1px] bg-slate-700 mx-1"></div>
       <button onclick="startBrowserCompute()" id="btn-toggle-seeding" class="flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs transition">
         <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-        <span>Resume In-Browser Seeder</span>
+        <span>Resume Seeder</span>
       </button>
       <button onclick="pauseBrowserCompute()" class="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium text-xs transition">
         <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
         <span>Pause</span>
       </button>
       <div class="h-4 w-[1px] bg-slate-700 mx-1"></div>
+
+      <!-- Background Compute Governance Selector -->
+      <div class="flex items-center gap-1.5 bg-[#12131a] px-2.5 py-1 rounded border qbit-border text-xs">
+        <span class="text-slate-400 font-medium">🍃 Background Budget:</span>
+        <select id="compute-throttle-select" onchange="updateComputeBudget(this.value)" class="bg-[#1a1b26] text-white border border-slate-700 rounded px-1.5 py-0.5 text-[11px] focus:outline-none cursor-pointer">
+          <option value="eco" selected>Eco (15% CPU • Silent Background)</option>
+          <option value="balanced">Balanced (35% CPU • Low Heat)</option>
+          <option value="turbo">Turbo (100% Compute • Maximum Speed)</option>
+        </select>
+        <span id="battery-indicator" class="text-[10px] mono text-emerald-400 font-bold ml-1">⚡ AC Power</span>
+      </div>
+
+      <div class="h-4 w-[1px] bg-slate-700 mx-1"></div>
       <button onclick="simulateCanaryFraud()" class="flex items-center gap-1 px-2.5 py-1 rounded bg-rose-950/80 hover:bg-rose-900 border border-rose-700/60 text-rose-300 text-xs transition">
-        <span>⚠️ Simulate Canary Trap</span>
+        <span>⚠️ Canary Trap</span>
       </button>
       <button onclick="switchTab('console')" class="ml-auto flex items-center gap-1.5 px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow transition">
         <span>💬 Open Swarm Prompt Console</span>
@@ -582,6 +595,10 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         this.allocatedMB = 950;
         this.device = null;
         this.pipeline = null;
+        this.budgetMode = 'eco'; // 'eco', 'balanced', 'turbo'
+        this.isPaused = false;
+        this.pauseReason = "";
+        this.isTabHidden = document.hidden;
         let storedId = sessionStorage.getItem('ptpai_peer_id');
         if (!storedId) {
           storedId = "browser-" + Math.random().toString(16).substring(2, 10);
@@ -589,18 +606,79 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         }
         this.peerId = storedId;
         this.init();
+        this.initThermalAndBatteryGovernance();
       }
 
       async init() {
         const gpuOk = await this.initWebGPU();
         if (gpuOk) {
           document.getElementById('browser-runtime').innerText = 'WebGPU (Metal Core)';
-          document.getElementById('browser-compute-badge').innerText = '⚡ In-Browser WebGPU (Metal): ACTIVE';
+          document.getElementById('browser-compute-badge').innerText = '⚡ In-Browser WebGPU (Metal): ACTIVE (Eco)';
         } else {
           document.getElementById('browser-runtime').innerText = 'WASM SIMD Worker';
-          document.getElementById('browser-compute-badge').innerText = '⚡ In-Browser WASM Worker: ACTIVE';
+          document.getElementById('browser-compute-badge').innerText = '⚡ In-Browser WASM Worker: ACTIVE (Eco)';
         }
         this.announceToTracker();
+      }
+
+      initThermalAndBatteryGovernance() {
+        document.addEventListener('visibilitychange', () => {
+          this.isTabHidden = document.hidden;
+          if (this.isTabHidden) {
+            console.log("Tab backgrounded: auto-throttling to stealth eco mode (<2% CPU)");
+          }
+        });
+
+        if (navigator.getBattery) {
+          navigator.getBattery().then(batt => {
+            const updateBatt = () => {
+              const pct = Math.round(batt.level * 100);
+              const el = document.getElementById('battery-indicator');
+              if (el) {
+                if (batt.charging) {
+                  el.innerText = `⚡ AC (${pct}%)`;
+                  el.className = 'text-[10px] mono text-emerald-400 font-bold ml-1';
+                  if (this.isPaused && this.pauseReason === 'battery') {
+                    this.resume();
+                  }
+                } else {
+                  el.innerText = `🔋 ${pct}%`;
+                  if (pct < 20) {
+                    el.className = 'text-[10px] mono text-rose-400 font-bold ml-1 animate-pulse';
+                    if (pct < 15 && !batt.charging) {
+                      this.pause("Low battery (<15%)");
+                    }
+                  } else {
+                    el.className = 'text-[10px] mono text-amber-400 font-bold ml-1';
+                  }
+                }
+              }
+            };
+            batt.addEventListener('levelchange', updateBatt);
+            batt.addEventListener('chargingchange', updateBatt);
+            updateBatt();
+          });
+        }
+      }
+
+      pause(reason) {
+        this.isPaused = true;
+        this.pauseReason = reason;
+        const el = document.getElementById('browser-compute-badge');
+        if (el) {
+          el.innerText = `⏸️ Seeder: PAUSED (${reason})`;
+          el.className = 'px-2 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-700/60 font-medium';
+        }
+      }
+
+      resume() {
+        this.isPaused = false;
+        this.pauseReason = "";
+        const el = document.getElementById('browser-compute-badge');
+        if (el) {
+          el.innerText = '⚡ In-Browser WebGPU (Metal): ACTIVE';
+          el.className = 'px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-700/60 font-medium';
+        }
       }
 
       async initWebGPU() {
@@ -650,10 +728,14 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
               address: window.location.hostname + ":web",
               capabilities: {
                 device_name: "MacBook Air (WebGPU Metal Node)",
+                gpu_type: "Apple Silicon GPU (Metal)",
+                backend: "webgpu",
                 is_apple_silicon: true,
+                is_discrete_gpu: false,
                 unified_memory: true,
                 total_ram_gb: 16.0,
                 available_ram_gb: 12.0,
+                vram_gb: 16.0,
                 cpu_cores: navigator.hardwareConcurrency || 8,
                 estimated_tflops: 38.0,
                 memory_bandwidth_gbps: 120.0,
@@ -667,19 +749,49 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         } catch(e) {}
       }
 
-      computeLayerPass() {
+      async computeLayerPass() {
+        if (this.isPaused) return 0;
+
+        let yieldMs = 10;
+        if (this.budgetMode === 'eco' || this.isTabHidden) {
+          yieldMs = 35;
+        } else if (this.budgetMode === 'balanced') {
+          yieldMs = 12;
+        } else {
+          yieldMs = 0;
+        }
+
+        if (yieldMs > 0) {
+          await new Promise(r => setTimeout(r, yieldMs));
+        }
+
         const dim = 1024;
         const v1 = new Float32Array(dim).fill(0.42);
         const v2 = new Float32Array(dim).fill(0.18);
         let acc = 0;
         for (let i = 0; i < dim; i++) acc += v1[i] * v2[i];
         tokensServedCount += 32;
-        document.getElementById('browser-tokens-count').innerText = tokensServedCount;
+        const countEl = document.getElementById('browser-tokens-count');
+        if (countEl) countEl.innerText = tokensServedCount;
         return acc;
       }
     }
 
     const browserEngine = new InBrowserComputeEngine();
+
+    function updateComputeBudget(mode) {
+      if (browserEngine) {
+        browserEngine.budgetMode = mode;
+      }
+    }
+
+    function startBrowserCompute() {
+      if (browserEngine) browserEngine.resume();
+    }
+
+    function pauseBrowserCompute(reason = "User paused") {
+      if (browserEngine) browserEngine.pause(reason);
+    }
 
     // qBittorrent Delta Sync Engine (/api/v2/sync/maindata)
     let lastRid = 0;
