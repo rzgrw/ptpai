@@ -1,0 +1,23 @@
+[Unit]
+Description=PTPAI - Decentralized AI Compute Daemon
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/lib/ptpai
+ExecStart=/usr/local/bin/ptpai tracker --port 8080
+Restart=always
+RestartSec=5s
+
+# High file descriptor limits for P2P torrent swarm connections
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+# Environment settings
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

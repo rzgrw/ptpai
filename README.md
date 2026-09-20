@@ -35,49 +35,82 @@ On Apple Silicon (M1/M2/M3/M4, Pro, Max, Ultra):
 
 ---
 
-## 🚀 Quickstart for Mac Users
+## 🚀 Quickstart: 1-Line Universal Installer (macOS & Ubuntu)
 
-### 1. Build Optimized Release Binary
+On **macOS** (Apple Silicon M1/M2/M3/M4) or **Ubuntu Linux** (NVIDIA CUDA / x86_64), install with a single command:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/rzgrw/ptpai/main/install.sh | bash
+```
+
+Or build manually from source:
+```bash
+git clone https://github.com/rzgrw/ptpai.git
+cd ptpai
 cargo build --release
 ```
 
-### 2. Run Local Systems Benchmark
+---
 
-Measures your Mac's unified memory bandwidth, BLAKE3 tree hashing speed, and SIMD activation kernels:
+## 🍏 macOS Usage (Apple Silicon & Metal)
 
+1. **Benchmark Hardware & Unified Memory Bandwidth**:
+   ```bash
+   ptpai benchmark
+   ```
+2. **Start Swarm Tracker & qBittorrent WebUI**:
+   ```bash
+   ptpai tracker --port 8080
+   ```
+   Open **`http://127.0.0.1:8080`** to browse models, copy Magnet links, and seed via WebGPU.
+3. **1-Command Seeding (Auto-Detects Unified Memory & Metal)**:
+   ```bash
+   ptpai seed --model llama-3.2-3b-instruct
+   ```
+
+---
+
+## 🐧 Ubuntu Linux Usage (NVIDIA CUDA & Server Daemons)
+
+1. **Native Seeding on Ubuntu with NVIDIA GPU**:
+   Auto-detects `nvidia-smi`, VRAM size, and starts seeding:
+   ```bash
+   ptpai seed --model llama-3.2-3b-instruct --tracker http://<tracker-ip>:8080
+   ```
+
+2. **Bridge an Existing Local Ollama / vLLM / llama.cpp Server**:
+   ```bash
+   ptpai seed \
+     --model llama-3.2-3b-instruct \
+     --tracker http://<tracker-ip>:8080 \
+     --bridge http://127.0.0.1:11434
+   ```
+
+3. **Run via Docker with NVIDIA Container Toolkit**:
+   ```bash
+   # Build the container
+   docker build -t ptpai:latest .
+
+   # Run with full NVIDIA GPU passthrough
+   docker run -d --gpus all \
+     -p 8080:8080 -p 8082:8082/udp \
+     --restart unless-stopped \
+     --name ptpai-daemon \
+     ptpai:latest tracker --port 8080
+   ```
+
+4. **Run as a 24/7 Ubuntu Systemd Service**:
+   ```bash
+   sudo cp ptpai.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now ptpai
+   ```
+
+---
+
+## 💬 Request Distributed Compute from the Swarm
+
+Run a prompt routed across the heterogeneous Mac + Ubuntu pipeline:
 ```bash
-./target/release/ptpai benchmark
-```
-
-### 3. Start Swarm Tracker & Web Dashboard
-
-```bash
-./target/release/ptpai tracker --port 8080
-```
-Open **`http://127.0.0.1:8080`** to view the live dashboard, peer topology, and token streaming playground.
-
-### 4. 1-Command Compute Seeding
-
-Auto-detects your Apple Silicon chip, unified memory capacity, and starts seeding:
-
-```bash
-./target/release/ptpai seed --model llama-3.2-3b-instruct
-```
-
-### 5. Request Distributed Compute
-
-Run a query routed across peer Mac seeds:
-
-```bash
-./target/release/ptpai run --prompt "Explain how torrent swarms accelerate AI"
-```
-
-### 6. Run Swarm & Anti-Fraud Simulation
-
-Demonstrates EigenTrust convergence, stealth canary probes, and fraud choking:
-
-```bash
-./target/release/ptpai simulate
+ptpai run --prompt "Explain how P2P compute pipelines cross-operate between Apple Silicon and Linux NVIDIA GPUs"
 ```
