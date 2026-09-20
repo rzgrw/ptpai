@@ -523,7 +523,10 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <div>
             <div class="flex items-start justify-between gap-2">
               <div>
-                <span class="text-[10px] px-2 py-0.5 rounded bg-blue-950 text-blue-400 border border-blue-800 mono uppercase font-bold">${item.quantization}</span>
+                <div class="flex items-center gap-2">
+                  <span class="text-[10px] px-2 py-0.5 rounded bg-blue-950 text-blue-400 border border-blue-800 mono uppercase font-bold">${item.quantization}</span>
+                  <span class="text-[10px] px-2 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800 mono font-bold">Req Ratio >= ${item.min_ratio_required.toFixed(2)} (${item.min_tokens_served_required} tok)</span>
+                </div>
                 <h3 class="text-sm font-bold text-white mt-2">${item.title}</h3>
               </div>
               <span class="text-xs mono font-bold text-emerald-400">${item.size_gb.toFixed(2)} GB</span>
@@ -538,6 +541,10 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
               <div class="flex justify-between text-slate-400">
                 <span>Min RAM Slice:</span>
                 <span class="text-emerald-400 font-bold">${item.required_unified_ram_gb.toFixed(2)} GB / Peer</span>
+              </div>
+              <div class="flex justify-between text-slate-400">
+                <span>Economic Gate:</span>
+                <span class="text-amber-300 font-bold">Ratio >= ${item.min_ratio_required.toFixed(2)} (${item.min_tokens_served_required} tok)</span>
               </div>
               <div class="flex justify-between text-slate-400">
                 <span>Swarm Layer Coverage:</span>
@@ -923,6 +930,31 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           })
         });
         const route = await routeRes.json();
+
+        // Enforce economic ratio gate
+        if (route.economic_error) {
+          const err = route.economic_error;
+          out.innerHTML = `<div class="p-3 rounded bg-rose-950/40 border border-rose-600/60 space-y-2">` +
+            `<div class="text-rose-400 font-bold text-sm flex items-center gap-2">` +
+            `<span>⛔ ACCESS CHOKED: PROOF-OF-SEEDING & RATIO REQUIRED</span>` +
+            `</div>` +
+            `<div class="text-slate-200 text-xs">${err.reason}</div>` +
+            `<div class="grid grid-cols-2 gap-2 text-[11px] mono pt-1 border-t border-rose-900/50">` +
+            `<div>Your Ratio: <strong class="text-amber-400">${err.current_ratio.toFixed(2)}</strong> (Required: <strong class="text-emerald-400">>= ${err.required_ratio.toFixed(2)}</strong>)</div>` +
+            `<div>Tokens Contributed: <strong class="text-amber-400">${err.tokens_served}</strong> (Required: <strong class="text-emerald-400">>= ${err.required_tokens}</strong>)</div>` +
+            `</div>` +
+            `<div class="text-[11px] text-slate-400 pt-1">💡 <strong class="text-cyan-300">How to unlock:</strong> Leave this browser tab open in the background! Your WebGPU seeder is currently hosting model shards. As other swarm peers route activations through your Mac, your ratio rises and unlocks this model automatically.</div>` +
+            `<div class="pt-2">` +
+            `<button onclick="fastSeedDemoCredits()" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-bold text-xs shadow transition flex items-center gap-1.5">` +
+            `<span>⚡ Seed 150 Tokens to Unlock (Instant Demo Credit)</span>` +
+            `</button>` +
+            `</div>` +
+            `</div>`;
+          btn.disabled = false;
+          btn.innerText = "Execute via 2x M4 Swarm";
+          return;
+        }
+
         browserEngine.computeLayerPass();
 
         const words = ("AITorrent Swarm Response (Llama 3.2 3B via 2x M4 Mac Airs):\n" +
@@ -966,8 +998,26 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     function simulateCanaryFraud() {
       fetch('/api/simulate-fraud', { method: 'POST' }).then(() => {
         alert("Canary Trap Triggered! Malicious peer returned 0-value logits. EigenTrust slashed to 0.0 & node choked.");
-        refreshPeers();
+        pollDeltaSync();
       });
+    }
+
+    async function fastSeedDemoCredits() {
+      const res = await fetch('/api/credit/seed', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          peer_id: browserEngine.peerId,
+          tokens: 150
+        })
+      });
+      const data = await res.json();
+      tokensServedCount = data.tokens_served;
+      document.getElementById('browser-tokens-count').innerText = tokensServedCount;
+      document.getElementById('browser-ratio').innerText = data.ratio.toFixed(2);
+      document.getElementById('browser-ratio').className = 'mono font-bold text-emerald-400';
+      alert(`Success! Seeded 150 tokens into the swarm.\nYour compute ratio is now ${data.ratio.toFixed(2)} (UNLOCKED)!\nResuming inference.`);
+      executeSwarmPrompt();
     }
 
     function drawSpeedGraph() {

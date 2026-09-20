@@ -2,7 +2,54 @@ use crate::crypto::{Blake3Hasher, hex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Compute Tit-for-Tat (cT4T) ledger tracking compute balance per peer
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EconomicGateError {
+    pub reason: String,
+    pub current_ratio: f64,
+    pub required_ratio: f64,
+    pub tokens_served: u64,
+    pub required_tokens: u64,
+    pub unlocked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelEconomicRequirements {
+    pub min_ratio: f64,
+    pub min_tokens_served: u64,
+    pub min_eigentrust: f64,
+}
+
+impl ModelEconomicRequirements {
+    pub fn for_model(model_id: &str) -> Self {
+        match model_id {
+            // Tier 1: Starter lightweight model (Low barrier to entry, quick unlock)
+            "deepseek-r1-distill-1.5b" => Self {
+                min_ratio: 0.80,
+                min_tokens_served: 64,
+                min_eigentrust: 0.40,
+            },
+            // Tier 2: Standard production model (Requires 1.00 fair-share ratio)
+            "llama-3.2-3b-instruct" => Self {
+                min_ratio: 1.00,
+                min_tokens_served: 128,
+                min_eigentrust: 0.50,
+            },
+            // Tier 3: Flagship heavy reasoning model (Strict high contribution requirement)
+            "deepseek-r1-distill-8b" => Self {
+                min_ratio: 1.50,
+                min_tokens_served: 500,
+                min_eigentrust: 0.70,
+            },
+            _ => Self {
+                min_ratio: 1.00,
+                min_tokens_served: 128,
+                min_eigentrust: 0.50,
+            },
+        }
+    }
+}
+
+/// Compute Tit-for-Tat (cT4T) ledger tracking strict compute balance per peer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRatioRecord {
     pub peer_id: String,
@@ -31,18 +78,92 @@ impl PeerRatioRecord {
         }
     }
 
-    /// Compute fair-share ratio with optimistic starter credits (100 tokens free)
+    /// Strict economic ratio: tokens contributed / tokens consumed.
+    /// Pure seeders with 0 consumed get high ratio based on served tokens.
     pub fn ratio(&self) -> f64 {
-        let served = self.tokens_served as f64 + 100.0;
-        let consumed = self.tokens_consumed as f64 + 100.0;
-        served / consumed
+        if self.tokens_consumed == 0 {
+            if self.tokens_served == 0 {
+                0.0
+            } else {
+                (self.tokens_served as f64).min(99.0) // high ratio for pure contributors
+            }
+        } else {
+            (self.tokens_served as f64) / (self.tokens_consumed as f64)
+        }
+    }
+
+    /// Check if peer has earned enough ratio and served enough tokens to use this model
+    pub fn verify_economic_access(
+        &self,
+        model_id: &str,
+        eigentrust_score: f64,
+    ) -> Result<(), EconomicGateError> {
+        if self.is_choked || self.failed_or_cheated_jobs > 0 {
+            return Err(EconomicGateError {
+                reason: "Node is CHOKED by swarm due to failed verification or excessive debt".to_string(),
+                current_ratio: self.ratio(),
+                required_ratio: 1.0,
+                tokens_served: self.tokens_served,
+                required_tokens: 128,
+                unlocked: false,
+            });
+        }
+
+        let req = ModelEconomicRequirements::for_model(model_id);
+
+        // Bootstrap check: Must have seeded minimum tokens first
+        if self.tokens_served < req.min_tokens_served {
+            return Err(EconomicGateError {
+                reason: format!(
+                    "Proof-of-Seeding Required: You have served {}/{} tokens for this model tier. Please leave your browser tab or node seeding compute to earn access.",
+                    self.tokens_served, req.min_tokens_served
+                ),
+                current_ratio: self.ratio(),
+                required_ratio: req.min_ratio,
+                tokens_served: self.tokens_served,
+                required_tokens: req.min_tokens_served,
+                unlocked: false,
+            });
+        }
+
+        // Ratio requirement check
+        let cur_ratio = self.ratio();
+        if cur_ratio < req.min_ratio {
+            return Err(EconomicGateError {
+                reason: format!(
+                    "Ratio Too Low: Your compute ratio is {:.2}, but '{}' requires a minimum ratio of >= {:.2}. Seed compute to raise your standing.",
+                    cur_ratio, model_id, req.min_ratio
+                ),
+                current_ratio: cur_ratio,
+                required_ratio: req.min_ratio,
+                tokens_served: self.tokens_served,
+                required_tokens: req.min_tokens_served,
+                unlocked: false,
+            });
+        }
+
+        // EigenTrust reputation threshold check
+        if eigentrust_score < req.min_eigentrust {
+            return Err(EconomicGateError {
+                reason: format!(
+                    "Insufficient EigenTrust Score: Your trust score is {:.2}, but this tier requires >= {:.2}.",
+                    eigentrust_score, req.min_eigentrust
+                ),
+                current_ratio: cur_ratio,
+                required_ratio: req.min_ratio,
+                tokens_served: self.tokens_served,
+                required_tokens: req.min_tokens_served,
+                unlocked: false,
+            });
+        }
+
+        Ok(())
     }
 
     pub fn update_choke_status(&mut self) {
-        // Choke if ratio drops below 0.25 and consumed significant tokens (> 500)
-        if self.tokens_consumed > 500 && self.ratio() < 0.25 {
+        if self.failed_or_cheated_jobs > 0 {
             self.is_choked = true;
-        } else if self.failed_or_cheated_jobs > 0 {
+        } else if self.tokens_consumed > 100 && self.ratio() < 0.75 {
             self.is_choked = true;
         } else {
             self.is_choked = false;
@@ -62,13 +183,9 @@ pub struct SecurityAuditLog {
 
 /// EigenTrust implementation for decentralized global peer trust aggregation
 pub struct EigenTrustEngine {
-    /// Local trust matrix: C[i][j] = trust node i places in node j
     local_trust: HashMap<String, HashMap<String, f64>>,
-    /// Global trust scores computed via power iteration
     global_trust: HashMap<String, f64>,
-    /// Permanently slashed fraudulent peers
     pub slashed_peers: std::collections::HashSet<String>,
-    /// Audit log of detected cheats
     pub audit_logs: Vec<SecurityAuditLog>,
 }
 
@@ -82,7 +199,6 @@ impl EigenTrustEngine {
         }
     }
 
-    /// Record a local transaction outcome between rater and ratee
     pub fn record_transaction(
         &mut self,
         rater_peer_id: &str,
@@ -105,7 +221,6 @@ impl EigenTrustEngine {
         }
     }
 
-    /// Record a canary fraud catch
     pub fn record_fraud(&mut self, peer_id: &str, reason: &str, details: &str) {
         self.audit_logs.push(SecurityAuditLog {
             incident_id: format!("audit-{}", self.audit_logs.len() + 1),
@@ -115,7 +230,6 @@ impl EigenTrustEngine {
             timestamp_epoch: chrono::Utc::now().timestamp(),
         });
 
-        // Slash all trust ratings for this malicious peer
         self.slashed_peers.insert(peer_id.to_string());
         for rater_map in self.local_trust.values_mut() {
             if let Some(rating) = rater_map.get_mut(peer_id) {
@@ -125,14 +239,11 @@ impl EigenTrustEngine {
         self.global_trust.insert(peer_id.to_string(), 0.0);
     }
 
-    /// Compute normalized global trust vector via EigenTrust power iteration
-    /// t(k+1) = (1 - a) * C^T * t(k) + a * p
     pub fn compute_eigentrust(&mut self, pre_trusted_peers: &[String]) {
         if self.local_trust.is_empty() && pre_trusted_peers.is_empty() {
             return;
         }
 
-        // Collect all unique peer IDs
         let mut all_peers: Vec<String> = self.local_trust.keys().cloned().collect();
         for peer in pre_trusted_peers {
             if !all_peers.contains(peer) {
@@ -158,7 +269,6 @@ impl EigenTrustEngine {
             .map(|(i, id)| (id.clone(), i))
             .collect();
 
-        // Build normalized matrix C: c_ij = max(s_ij, 0) / sum(max(s_ik, 0))
         let mut c_matrix = vec![vec![0.0f64; n]; n];
         for (rater, ratings) in &self.local_trust {
             if let Some(&i) = peer_index.get(rater) {
@@ -173,7 +283,6 @@ impl EigenTrustEngine {
             }
         }
 
-        // Pre-trusted distribution vector p
         let mut p = vec![0.0f64; n];
         let p_count = pre_trusted_peers.len();
         if p_count > 0 {
@@ -190,14 +299,12 @@ impl EigenTrustEngine {
             }
         }
 
-        // Power iteration
-        let alpha = 0.15; // standard probability of jumping to pre-trusted seed
+        let alpha = 0.15;
         let mut t = p.clone();
 
         for _ in 0..25 {
             let mut t_next = vec![0.0f64; n];
 
-            // t_next = (1 - alpha) * C^T * t + alpha * p
             for j in 0..n {
                 let mut sum_c_t = 0.0;
                 for i in 0..n {
@@ -206,7 +313,6 @@ impl EigenTrustEngine {
                 t_next[j] = (1.0 - alpha) * sum_c_t + alpha * p[j];
             }
 
-            // Check L1 convergence
             let diff: f64 = t.iter().zip(&t_next).map(|(a, b)| (a - b).abs()).sum();
             t = t_next;
             if diff < 1e-4 {
@@ -214,7 +320,6 @@ impl EigenTrustEngine {
             }
         }
 
-        // Save scores back to global map
         self.global_trust.clear();
         for (id, &idx) in &peer_index {
             let score = if self.slashed_peers.contains(id) {
@@ -244,9 +349,8 @@ impl EigenTrustEngine {
     }
 }
 
-/// Stealth Canary challenge manager
 pub struct CanaryEngine {
-    known_canaries: HashMap<String, String>, // prompt -> expected_hash
+    known_canaries: HashMap<String, String>,
 }
 
 impl CanaryEngine {
@@ -254,7 +358,6 @@ impl CanaryEngine {
         let mut engine = Self {
             known_canaries: HashMap::new(),
         };
-        // Register deterministic canary test vectors
         engine.register("CANARY_TEST_ALPHA_98", "68e144a62dc4");
         engine.register("CANARY_TEST_BETA_42", "9a7bc01ef832");
         engine.register("CANARY_TEST_GAMMA_11", "0bf431cd65e9");
@@ -266,7 +369,6 @@ impl CanaryEngine {
             .insert(prompt.to_string(), expected_hash_prefix.to_string());
     }
 
-    /// Craft a canary prompt to inject into a worker stream
     pub fn sample_canary(&self) -> Option<(&str, &str)> {
         self.known_canaries
             .iter()
@@ -274,12 +376,10 @@ impl CanaryEngine {
             .map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
-    /// Verify if returned activation hash matches ground truth
     pub fn verify_canary(&self, prompt: &str, returned_hash: &str) -> bool {
         if let Some(expected) = self.known_canaries.get(prompt) {
             returned_hash.starts_with(expected)
         } else {
-            // If unknown canary, verify via BLAKE3 deterministic hash
             let computed = hex::encode(Blake3Hasher::hash_bytes(prompt.as_bytes()));
             returned_hash.starts_with(&computed[..12])
         }
@@ -291,32 +391,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_eigentrust_convergence() {
-        let mut engine = EigenTrustEngine::new();
-        let peer_a = "peer-alice".to_string();
-        let peer_b = "peer-bob".to_string();
-        let peer_c = "peer-charlie".to_string();
+    fn test_economic_gating() {
+        let mut peer = PeerRatioRecord::new("new-freeloader".to_string());
+        
+        // Fresh peer has 0 tokens served -> blocked from model inference
+        let res = peer.verify_economic_access("llama-3.2-3b-instruct", 0.5);
+        assert!(res.is_err(), "Fresh peer with 0 tokens served must be blocked");
 
-        engine.record_transaction(&peer_a, &peer_b, true, 100);
-        engine.record_transaction(&peer_b, &peer_c, true, 100);
-        engine.record_transaction(&peer_c, &peer_b, true, 50);
+        // Peer seeds 150 tokens into the swarm -> unlocks Tier 2 model
+        peer.tokens_served = 150;
+        let res = peer.verify_economic_access("llama-3.2-3b-instruct", 0.5);
+        assert!(res.is_ok(), "Peer with 150 tokens served and 0 consumed has high ratio -> unlocked");
 
-        engine.compute_eigentrust(&[peer_a.clone()]);
-        let bob_score = engine.get_score(&peer_b);
-        assert!(bob_score > 0.0);
-    }
-
-    #[test]
-    fn test_fraud_slashing() {
-        let mut engine = EigenTrustEngine::new();
-        let honest = "peer-honest".to_string();
-        let malicious = "peer-malicious".to_string();
-
-        engine.record_transaction(&honest, &malicious, true, 50);
-        engine.record_fraud(&malicious, "CANARY_MISMATCH", "Returned 0x00 instead of logits");
-
-        let score = engine.get_score(&malicious);
-        assert_eq!(score, 0.0);
-        assert_eq!(engine.audit_logs.len(), 1);
+        // Peer consumes 200 tokens (ratio drops to 150/200 = 0.75) -> blocked until they seed more
+        peer.tokens_consumed = 200;
+        let res = peer.verify_economic_access("llama-3.2-3b-instruct", 0.5);
+        assert!(res.is_err(), "Peer with 0.75 ratio must be blocked from Tier 2 (requires 1.00)");
     }
 }

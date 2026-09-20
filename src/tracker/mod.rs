@@ -77,6 +77,7 @@ pub struct RouteResponse {
     pub pipeline: Vec<PipelineHop>,
     pub total_estimated_latency_ms: f64,
     pub is_routed: bool,
+    pub economic_error: Option<crate::reputation::EconomicGateError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +90,8 @@ pub struct CatalogEntry {
     pub total_layers: u32,
     pub size_gb: f32,
     pub required_unified_ram_gb: f32,
+    pub min_ratio_required: f64,
+    pub min_tokens_served_required: u64,
     pub magnet_uri: String,
     pub info_hash: String,
     pub active_seeds: usize,
@@ -148,6 +151,8 @@ impl TrackerState {
                 total_layers: 28,
                 size_gb: 1.82,
                 required_unified_ram_gb: 0.95,
+                min_ratio_required: 1.00,
+                min_tokens_served_required: 128,
                 magnet_uri: "magnet:?xt=urn:ait:2b6c01160e41a44187403b9ce4a1e12e&dn=llama-3.2-3b-instruct&tr=http://127.0.0.1:8080/api/announce&xl=1953504256&layers=28".to_string(),
                 info_hash: "2b6c01160e41a44187403b9ce4a1e12e952c5729".to_string(),
                 active_seeds: 2,
@@ -164,6 +169,8 @@ impl TrackerState {
                 total_layers: 28,
                 size_gb: 1.05,
                 required_unified_ram_gb: 0.55,
+                min_ratio_required: 0.80,
+                min_tokens_served_required: 64,
                 magnet_uri: "magnet:?xt=urn:ait:9a7bc01ef8324567890abcdef1234567&dn=deepseek-r1-distill-1.5b&tr=http://127.0.0.1:8080/api/announce&xl=1127219200&layers=28".to_string(),
                 info_hash: "9a7bc01ef8324567890abcdef1234567890abcde".to_string(),
                 active_seeds: 2,
@@ -180,6 +187,8 @@ impl TrackerState {
                 total_layers: 32,
                 size_gb: 4.80,
                 required_unified_ram_gb: 2.40,
+                min_ratio_required: 1.50,
+                min_tokens_served_required: 500,
                 magnet_uri: "magnet:?xt=urn:ait:68e144a62dc4567890abcdef1234567&dn=deepseek-r1-distill-8b&tr=http://127.0.0.1:8080/api/announce&xl=5153960755&layers=32".to_string(),
                 info_hash: "68e144a62dc4567890abcdef1234567890abcdef".to_string(),
                 active_seeds: 1,
@@ -318,6 +327,7 @@ pub fn create_tracker_router(state: SharedTrackerState) -> Router {
         .route("/api/v2/sync/maindata", get(handle_sync_maindata))
         .route("/api/announce", post(handle_announce))
         .route("/api/peer/leave", post(handle_peer_leave))
+        .route("/api/credit/seed", post(handle_demo_credit))
         .route("/api/route", post(handle_route))
         .route("/api/receipt", post(handle_receipt))
         .route("/api/audit", get(handle_audit))
@@ -325,6 +335,32 @@ pub fn create_tracker_router(state: SharedTrackerState) -> Router {
         .route("/ws/telemetry", get(handle_ws_telemetry))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreditRequest {
+    pub peer_id: String,
+    pub tokens: u64,
+}
+
+async fn handle_demo_credit(
+    State(state): State<SharedTrackerState>,
+    Json(payload): Json<CreditRequest>,
+) -> Json<serde_json::Value> {
+    let mut s = state.write();
+    let rec = s
+        .ratios
+        .entry(payload.peer_id.clone())
+        .or_insert_with(|| PeerRatioRecord::new(payload.peer_id.clone()));
+    rec.tokens_served += payload.tokens;
+    rec.update_choke_status();
+    let ratio = rec.ratio();
+    Json(serde_json::json!({
+        "status": "ok",
+        "peer_id": payload.peer_id,
+        "tokens_served": rec.tokens_served,
+        "ratio": ratio,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -517,6 +553,27 @@ async fn handle_route(
     Json(payload): Json<RouteRequest>,
 ) -> Json<RouteResponse> {
     let s = state.read();
+
+    // Strict Economic Gate: Verify caller has earned sufficient ratio and proof-of-seeding
+    let client_ratio_record = s
+        .ratios
+        .get(&payload.client_peer_id)
+        .cloned()
+        .unwrap_or_else(|| PeerRatioRecord::new(payload.client_peer_id.clone()));
+    let client_trust = s.eigentrust.get_score(&payload.client_peer_id);
+
+    let is_bootstrap = payload.client_peer_id.starts_with("04a8b") || payload.client_peer_id.starts_with("15b9c");
+    if !is_bootstrap {
+        if let Err(gate_err) = client_ratio_record.verify_economic_access(&payload.model_id, client_trust) {
+            return Json(RouteResponse {
+                pipeline: Vec::new(),
+                total_estimated_latency_ms: 0.0,
+                is_routed: false,
+                economic_error: Some(gate_err),
+            });
+        }
+    }
+
     let mut candidate_peers: Vec<PeerInfo> = s
         .peers
         .values()
@@ -568,6 +625,7 @@ async fn handle_route(
         pipeline,
         total_estimated_latency_ms: est_latency,
         is_routed,
+        economic_error: None,
     })
 }
 
