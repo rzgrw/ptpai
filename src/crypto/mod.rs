@@ -1,7 +1,13 @@
+pub mod aead;
+pub mod shield;
+
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey, Signature};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+pub use aead::{P2pAeadCipher, SessionKeyExchange};
+pub use shield::TokenShield;
 
 #[derive(Clone)]
 pub struct NodeIdentity {

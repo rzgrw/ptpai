@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use crate::crypto::aead::P2pAeadCipher;
 use std::io;
 
 pub const MAGIC_BYTES: &[u8; 4] = b"AIT1";
@@ -67,6 +68,7 @@ impl PacketHeader {
     pub const FLAG_CANARY: u8 = 1 << 0;
     pub const FLAG_COMPRESSED: u8 = 1 << 1;
     pub const FLAG_RECEIPT_REQ: u8 = 1 << 2;
+    pub const FLAG_ENCRYPTED: u8 = 1 << 3;
 
     pub fn new(msg_type: MessageType, sequence_id: u64, payload: &[u8]) -> Self {
         let hash = blake3::hash(payload);
@@ -93,6 +95,20 @@ impl PacketHeader {
 
     pub fn is_compressed(&self) -> bool {
         (self.flags & Self::FLAG_COMPRESSED) != 0
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        (self.flags & Self::FLAG_ENCRYPTED) != 0
+    }
+
+    /// Fixed 14-byte Associated Authenticated Data (AAD) for AEAD cipher: [Magic (4) | MsgType (1) | Flags (1) | SeqId (8)]
+    pub fn aad_bytes(&self) -> [u8; 14] {
+        let mut aad = [0u8; 14];
+        aad[..4].copy_from_slice(MAGIC_BYTES);
+        aad[4] = self.msg_type as u8;
+        aad[5] = self.flags | Self::FLAG_ENCRYPTED;
+        aad[6..14].copy_from_slice(&self.sequence_id.to_be_bytes());
+        aad
     }
 
     pub fn encode(&self, dst: &mut BytesMut) {
@@ -193,6 +209,38 @@ impl WireFrame {
         }
         Ok(Self { header, payload })
     }
+
+    /// Encrypt frame payload in-place using ChaCha20-Poly1305 AEAD with header as authenticated data
+    pub fn encrypt_with_cipher(&mut self, cipher: &P2pAeadCipher) -> Result<(), String> {
+        let aad = self.header.aad_bytes();
+        let (ciphertext, _) = cipher.encrypt(self.header.sequence_id, &self.payload, &aad)?;
+        let cipher_hash = blake3::hash(&ciphertext);
+
+        self.header.flags |= PacketHeader::FLAG_ENCRYPTED;
+        self.header.payload_len = ciphertext.len() as u32;
+        self.header.blake3_checksum.copy_from_slice(&cipher_hash.as_bytes()[..12]);
+        self.payload = Bytes::from(ciphertext);
+
+        Ok(())
+    }
+
+    /// Decrypt and verify Poly1305 MAC of payload in-place
+    pub fn decrypt_with_cipher(&mut self, cipher: &P2pAeadCipher) -> Result<(), String> {
+        if !self.header.is_encrypted() {
+            return Ok(());
+        }
+
+        let aad = self.header.aad_bytes();
+        let plaintext = cipher.decrypt(self.header.sequence_id, &self.payload, &aad)?;
+        let plain_hash = blake3::hash(&plaintext);
+
+        self.header.flags &= !PacketHeader::FLAG_ENCRYPTED;
+        self.header.payload_len = plaintext.len() as u32;
+        self.header.blake3_checksum.copy_from_slice(&plain_hash.as_bytes()[..12]);
+        self.payload = Bytes::from(plaintext);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +273,29 @@ mod tests {
 
         let res = WireFrame::decode(Bytes::from(encoded));
         assert!(res.is_err(), "Must detect tampered payload via BLAKE3");
+    }
+
+    #[test]
+    fn test_aead_wire_frame_encryption() {
+        let key = [0x42u8; 32];
+        let cipher = P2pAeadCipher::new(&key);
+
+        let original_payload = Bytes::from_static(b"Secret Activation Tensor: [1.23, 4.56, -7.89]");
+        let mut frame = WireFrame::new(MessageType::ActivationChunk, 101, original_payload.clone());
+
+        // Encrypt in-place
+        frame.encrypt_with_cipher(&cipher).expect("encryption failed");
+        assert!(frame.header.is_encrypted());
+        assert_ne!(frame.payload, original_payload);
+
+        // Encode to wire format and decode
+        let wire_bytes = frame.encode();
+        let mut decoded_frame = WireFrame::decode(wire_bytes).expect("wire decode failed");
+        assert!(decoded_frame.header.is_encrypted());
+
+        // Decrypt in-place
+        decoded_frame.decrypt_with_cipher(&cipher).expect("decryption failed");
+        assert!(!decoded_frame.header.is_encrypted());
+        assert_eq!(decoded_frame.payload, original_payload);
     }
 }
