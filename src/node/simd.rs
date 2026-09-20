@@ -1,11 +1,15 @@
-/// Low-level SIMD (ARM NEON / AVX) vector operations for zero-copy activation compute.
+/// Low-level SIMD (ARM NEON / x86_64 AVX2) vector operations for zero-copy activation compute.
 /// On Apple Silicon (aarch64), this uses hardware 128-bit vector registers directly.
+/// On Linux/x86_64, this uses 256-bit AVX2 + FMA hardware vector registers.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 /// High-throughput dot-product kernel.
-/// Computes sum(a[i] * b[i]) using 128-bit SIMD registers with loop unrolling.
+/// Computes sum(a[i] * b[i]) using 128-bit NEON or 256-bit AVX2 registers with loop unrolling.
 #[inline(always)]
 pub fn vector_dot_product(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "Vector lengths must match");
@@ -16,14 +20,23 @@ pub fn vector_dot_product(a: &[f32], b: &[f32]) -> f32 {
         neon_dot_product_f32(a.as_ptr(), b.as_ptr(), len)
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            avx2_dot_product_f32(a.as_ptr(), b.as_ptr(), len)
+        } else {
+            portable_dot_product_f32(a, b)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         portable_dot_product_f32(a, b)
     }
 }
 
 /// Quantize FP32 activations to INT8 with dynamic scaling factor.
-/// Returns (scale, int8_buffer)
+/// Returns scale
 #[inline(always)]
 pub fn quantize_activation_fp32_to_int8(src: &[f32], dst: &mut [i8]) -> f32 {
     assert_eq!(src.len(), dst.len(), "Buffer sizes must match");
@@ -49,7 +62,6 @@ pub fn quantize_activation_fp32_to_int8(src: &[f32], dst: &mut [i8]) -> f32 {
             let v_scaled = vmulq_f32(v_src, v_inv_scale);
             let v_int32 = vcvtq_s32_f32(v_scaled);
 
-            // Store packed 32-bit values clamped to i8
             let ptr = dst.as_mut_ptr().add(i);
             *ptr.add(0) = vgetq_lane_s32(v_int32, 0).clamp(-128, 127) as i8;
             *ptr.add(1) = vgetq_lane_s32(v_int32, 1).clamp(-128, 127) as i8;
@@ -58,7 +70,6 @@ pub fn quantize_activation_fp32_to_int8(src: &[f32], dst: &mut [i8]) -> f32 {
             i += 4;
         }
 
-        // Remainder
         while i < src.len() {
             dst[i] = (src[i] * inv_scale).clamp(-128.0, 127.0) as i8;
             i += 1;
@@ -126,7 +137,6 @@ unsafe fn neon_dot_product_f32(mut a_ptr: *const f32, mut b_ptr: *const f32, mut
         let mut sum2 = vdupq_n_f32(0.0);
         let mut sum3 = vdupq_n_f32(0.0);
 
-        // 16 f32s per loop iteration (4 x 128-bit NEON registers)
         while len >= 16 {
             let a0 = vld1q_f32(a_ptr);
             let b0 = vld1q_f32(b_ptr);
@@ -149,12 +159,10 @@ unsafe fn neon_dot_product_f32(mut a_ptr: *const f32, mut b_ptr: *const f32, mut
             len -= 16;
         }
 
-        // Accumulate the 4 accumulators
         let sum_pair1 = vaddq_f32(sum0, sum1);
         let sum_pair2 = vaddq_f32(sum2, sum3);
         let mut total_sum = vaddq_f32(sum_pair1, sum_pair2);
 
-        // Handle remaining 4-element chunks
         while len >= 4 {
             let a = vld1q_f32(a_ptr);
             let b = vld1q_f32(b_ptr);
@@ -164,10 +172,8 @@ unsafe fn neon_dot_product_f32(mut a_ptr: *const f32, mut b_ptr: *const f32, mut
             len -= 4;
         }
 
-        // Horizontal reduction across 128-bit NEON lane
         let mut acc = vaddvq_f32(total_sum);
 
-        // Remainder elements
         while len > 0 {
             acc += *a_ptr * *b_ptr;
             a_ptr = a_ptr.add(1);
@@ -179,7 +185,59 @@ unsafe fn neon_dot_product_f32(mut a_ptr: *const f32, mut b_ptr: *const f32, mut
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_dot_product_f32(mut a_ptr: *const f32, mut b_ptr: *const f32, mut len: usize) -> f32 {
+    unsafe {
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+
+        while len >= 16 {
+            let a0 = _mm256_loadu_ps(a_ptr);
+            let b0 = _mm256_loadu_ps(b_ptr);
+            sum0 = _mm256_fmadd_ps(a0, b0, sum0);
+
+            let a1 = _mm256_loadu_ps(a_ptr.add(8));
+            let b1 = _mm256_loadu_ps(b_ptr.add(8));
+            sum1 = _mm256_fmadd_ps(a1, b1, sum1);
+
+            a_ptr = a_ptr.add(16);
+            b_ptr = b_ptr.add(16);
+            len -= 16;
+        }
+
+        let mut total_sum = _mm256_add_ps(sum0, sum1);
+
+        while len >= 8 {
+            let a = _mm256_loadu_ps(a_ptr);
+            let b = _mm256_loadu_ps(b_ptr);
+            total_sum = _mm256_fmadd_ps(a, b, total_sum);
+            a_ptr = a_ptr.add(8);
+            b_ptr = b_ptr.add(8);
+            len -= 8;
+        }
+
+        let hi128 = _mm256_extractf128_ps(total_sum, 1);
+        let lo128 = _mm256_castps256_ps128(total_sum);
+        let sum128 = _mm_add_ps(lo128, hi128);
+        let shuf = _mm_movehl_ps(sum128, sum128);
+        let sum64 = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_shuffle_ps(sum64, sum64, 1);
+        let res = _mm_add_ss(sum64, shuf2);
+        let mut acc = _mm_cvtss_f32(res);
+
+        while len > 0 {
+            acc += *a_ptr * *b_ptr;
+            a_ptr = a_ptr.add(1);
+            b_ptr = b_ptr.add(1);
+            len -= 1;
+        }
+
+        acc
+    }
+}
+
+#[allow(dead_code)]
 #[inline(always)]
 fn portable_dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0f32;
@@ -194,7 +252,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_neon_dot_product() {
+    fn test_vector_dot_product() {
         let a = vec![1.0f32; 1024];
         let b = vec![2.0f32; 1024];
         let res = vector_dot_product(&a, &b);

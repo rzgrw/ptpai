@@ -582,7 +582,12 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         this.allocatedMB = 950;
         this.device = null;
         this.pipeline = null;
-        this.peerId = "browser-" + Math.random().toString(16).substring(2, 10);
+        let storedId = sessionStorage.getItem('ptpai_peer_id');
+        if (!storedId) {
+          storedId = "browser-" + Math.random().toString(16).substring(2, 10);
+          sessionStorage.setItem('ptpai_peer_id', storedId);
+        }
+        this.peerId = storedId;
         this.init();
       }
 
@@ -890,6 +895,15 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     pollDeltaSync();
     setInterval(pollDeltaSync, 2000);
     loadCatalog();
+
+    // Gracefully inform tracker when user closes tab
+    window.addEventListener('beforeunload', () => {
+      if (browserEngine && browserEngine.peerId) {
+        const payload = JSON.stringify({ peer_id: browserEngine.peerId });
+        const blob = new Blob([payload], { type: 'application/json' });
+        navigator.sendBeacon('/api/peer/leave', blob);
+      }
+    });
   </script>
 </body>
 </html>

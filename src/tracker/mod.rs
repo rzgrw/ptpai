@@ -14,7 +14,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
@@ -221,13 +222,17 @@ impl TrackerState {
         for (id, dev, is_apple, ram, tflops, models, layers) in demo_nodes {
             let caps = PeerCapabilities {
                 device_name: dev.to_string(),
+                gpu_type: "Apple Silicon GPU (Metal)".to_string(),
+                backend: "metal".to_string(),
                 is_apple_silicon: is_apple,
+                is_discrete_gpu: false,
                 unified_memory: is_apple,
                 total_ram_gb: ram,
                 available_ram_gb: ram * 0.8,
-                cpu_cores: 12,
+                vram_gb: ram,
+                cpu_cores: 10,
                 estimated_tflops: tflops,
-                memory_bandwidth_gbps: 300.0,
+                memory_bandwidth_gbps: 120.0,
                 supported_quantizations: vec!["q4_k_m".to_string(), "fp8".to_string()],
             };
 
@@ -283,9 +288,26 @@ impl TrackerState {
             cheated_nodes_choked: choked_count,
         }
     }
+
+    /// Automatically prune stale peers that stopped heartbeating (> 45s idle)
+    pub fn prune_stale_peers(&mut self, max_idle_secs: u64) {
+        let now = std::time::Instant::now();
+        let stale_ids: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|(id, (_, instant))| {
+                !id.starts_with("04a8b") && !id.starts_with("15b9c") && now.duration_since(*instant).as_secs() > max_idle_secs
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in stale_ids {
+            self.peers.remove(&id);
+        }
+    }
 }
 
-pub type SharedTrackerState = Arc<Mutex<TrackerState>>;
+pub type SharedTrackerState = Arc<RwLock<TrackerState>>;
 
 pub fn create_tracker_router(state: SharedTrackerState) -> Router {
     Router::new()
@@ -314,7 +336,7 @@ async fn handle_peer_leave(
     State(state): State<SharedTrackerState>,
     Json(payload): Json<LeaveRequest>,
 ) -> Json<serde_json::Value> {
-    let mut s = state.lock().unwrap();
+    let mut s = state.write();
     s.peers.remove(&payload.peer_id);
     let _ = s.event_tx.send(SwarmEvent {
         event_type: "PEER_LEFT".to_string(),
@@ -329,7 +351,8 @@ async fn handle_sync_maindata(
     State(state): State<SharedTrackerState>,
     Query(params): Query<SyncQueryParams>,
 ) -> Json<serde_json::Value> {
-    let mut s = state.lock().unwrap();
+    let mut s = state.write();
+    s.prune_stale_peers(45);
     s.rid += 1;
     let current_rid = s.rid;
     let client_rid = params.rid.unwrap_or(0);
@@ -390,7 +413,7 @@ async fn handle_sync_maindata(
 }
 
 async fn handle_catalog(State(state): State<SharedTrackerState>) -> Json<Vec<CatalogEntry>> {
-    let s = state.lock().unwrap();
+    let s = state.read();
     Json(s.catalog.clone())
 }
 
@@ -398,7 +421,7 @@ async fn handle_publish_catalog(
     State(state): State<SharedTrackerState>,
     Json(entry): Json<CatalogEntry>,
 ) -> Json<serde_json::Value> {
-    let mut s = state.lock().unwrap();
+    let mut s = state.write();
     s.catalog.push(entry.clone());
     let _ = s.event_tx.send(SwarmEvent {
         event_type: "TORRENT_PUBLISHED".to_string(),
@@ -414,12 +437,14 @@ async fn handle_publish_catalog(
 }
 
 async fn handle_status(State(state): State<SharedTrackerState>) -> Json<SwarmStats> {
-    let s = state.lock().unwrap();
+    let mut s = state.write();
+    s.prune_stale_peers(45);
     Json(s.get_stats())
 }
 
 async fn handle_peers(State(state): State<SharedTrackerState>) -> Json<Vec<PeerInfo>> {
-    let s = state.lock().unwrap();
+    let mut s = state.write();
+    s.prune_stale_peers(45);
     let mut list = Vec::new();
     let now = std::time::Instant::now();
 
@@ -435,7 +460,7 @@ async fn handle_announce(
     State(state): State<SharedTrackerState>,
     Json(payload): Json<AnnounceRequest>,
 ) -> Json<serde_json::Value> {
-    let mut s = state.lock().unwrap();
+    let mut s = state.write();
     let now = std::time::Instant::now();
     let peer_id = payload.peer_id.clone();
 
@@ -469,9 +494,10 @@ async fn handle_announce(
             event_type: "PEER_JOINED".to_string(),
             peer_id: peer_id.clone(),
             message: format!(
-                "Peer joined swarm: {} (UMA: {} GB, TFLOPS: {:.1})",
+                "Peer joined swarm: {} (GPU: {}, VRAM: {:.1} GB, TFLOPS: {:.1})",
                 payload.capabilities.device_name,
-                payload.capabilities.total_ram_gb,
+                payload.capabilities.gpu_type,
+                payload.capabilities.vram_gb,
                 payload.capabilities.estimated_tflops
             ),
             timestamp_epoch: chrono::Utc::now().timestamp(),
@@ -490,7 +516,7 @@ async fn handle_route(
     State(state): State<SharedTrackerState>,
     Json(payload): Json<RouteRequest>,
 ) -> Json<RouteResponse> {
-    let s = state.lock().unwrap();
+    let s = state.read();
     let mut candidate_peers: Vec<PeerInfo> = s
         .peers
         .values()
@@ -498,8 +524,6 @@ async fn handle_route(
         .filter(|p| !p.is_choked && p.seeded_models.contains(&payload.model_id))
         .collect();
 
-    // Sort candidate peers primarily by sequential layer order (layer_start asc)
-    // and secondarily by reputation_score desc
     candidate_peers.sort_by(|a, b| {
         a.layer_range.0.cmp(&b.layer_range.0).then_with(|| {
             b.reputation_score
@@ -533,7 +557,7 @@ async fn handle_route(
         }
     }
 
-    let is_routed = !pipeline.is_empty();
+    let is_routed = covered_layers >= target_layers && !pipeline.is_empty();
     let est_latency = if is_routed {
         (pipeline.len() as f64) * 22.5 + 15.0
     } else {
@@ -551,7 +575,7 @@ async fn handle_receipt(
     State(state): State<SharedTrackerState>,
     Json(receipt): Json<ComputeReceipt>,
 ) -> Json<serde_json::Value> {
-    let mut s = state.lock().unwrap();
+    let mut s = state.write();
     if !receipt.verify() {
         return Json(serde_json::json!({
             "status": "error",
@@ -563,7 +587,6 @@ async fn handle_receipt(
     let consumer = receipt.consumer_peer_id.clone();
     let tokens = receipt.tokens_processed;
 
-    // Update ratio accounts
     let provider_ratio = {
         let prov_rec = s
             .ratios
@@ -586,12 +609,10 @@ async fn handle_receipt(
         cons_rec.update_choke_status();
     }
 
-    // Update EigenTrust
     s.eigentrust
         .record_transaction(&consumer, &provider, true, tokens);
     s.eigentrust.compute_eigentrust(&[]);
 
-    // Broadcast telemetry event
     let _ = s.event_tx.send(SwarmEvent {
         event_type: "RECEIPT_VERIFIED".to_string(),
         peer_id: provider.clone(),
@@ -612,14 +633,14 @@ async fn handle_receipt(
 }
 
 async fn handle_audit(State(state): State<SharedTrackerState>) -> Json<Vec<SecurityAuditLog>> {
-    let s = state.lock().unwrap();
+    let s = state.read();
     Json(s.eigentrust.audit_logs.clone())
 }
 
 async fn handle_simulate_fraud(
     State(state): State<SharedTrackerState>,
 ) -> Json<serde_json::Value> {
-    let mut s = state.lock().unwrap();
+    let mut s = state.write();
     let cheater_id = "badf00d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
 
     s.eigentrust.record_fraud(
@@ -663,7 +684,7 @@ async fn handle_ws_telemetry(
 
 async fn telemetry_socket(mut socket: WebSocket, state: SharedTrackerState) {
     let mut rx = {
-        let s = state.lock().unwrap();
+        let s = state.read();
         s.event_tx.subscribe()
     };
 

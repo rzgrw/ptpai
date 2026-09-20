@@ -6,7 +6,8 @@ use ptpai::tracker::{create_tracker_router, TrackerState};
 use ptpai::web::create_web_router;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::Instant;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -26,12 +27,15 @@ enum Commands {
         #[arg(short, long, default_value = "8080")]
         port: u16,
     },
-    /// Seed compute power into the swarm (Auto-detects Apple Silicon Unified Memory)
+    /// Seed compute power into the swarm (Auto-detects Apple Silicon or Linux GPUs)
     Seed {
         #[arg(short, long, default_value = "llama-3.2-3b-instruct")]
         model: String,
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         tracker: String,
+        /// Optional local Linux GPU bridge URL (e.g. http://127.0.0.1:11434 for Ollama or http://127.0.0.1:8000 for vLLM)
+        #[arg(short, long)]
+        bridge: Option<String>,
     },
     /// Request distributed compute from the swarm
     Run {
@@ -62,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Tracker { port } => {
             info!("Starting AITorrent Swarm Tracker on port {}", port);
-            let state = Arc::new(Mutex::new(TrackerState::new()));
+            let state = Arc::new(RwLock::new(TrackerState::new()));
             
             // Spawn STUN UDP NAT traversal service on port 3478 (fallback to port + 2)
             let stun_port = port + 2;
@@ -82,25 +86,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
         }
 
-        Commands::Seed { model, tracker } => {
+        Commands::Seed { model, tracker, bridge } => {
             println!("============================================================");
-            println!("           AITorrent — Seeder Node Daemon                   ");
+            println!("             PTPAI — Compute Seeder Daemon                  ");
             println!("============================================================");
             
             let caps = PeerCapabilities::detect();
-            println!("Hardware Detected: {}", caps.device_name);
-            println!("Architecture:       {}", if caps.is_apple_silicon { "Apple Silicon (ARM64)" } else { "Standard CPU/GPU" });
-            println!("Memory Model:       {}", if caps.unified_memory { "Unified Memory Architecture (UMA) - Zero PCIe Copies" } else { "Discrete VRAM/RAM" });
-            println!("Total Memory:       {:.2} GB", caps.total_ram_gb);
-            println!("Available Memory:   {:.2} GB", caps.available_ram_gb);
+            println!("Device Name:        {}", caps.device_name);
+            println!("GPU / Backend:      {} ({})", caps.gpu_type, caps.backend);
+            println!("Architecture:       {}", if caps.is_apple_silicon { "Apple Silicon (ARM64)" } else { "Linux / x86_64" });
+            println!("Memory Model:       {}", if caps.unified_memory { "Unified Memory Architecture (UMA)" } else { "Discrete VRAM / System RAM" });
+            println!("System RAM:         {:.2} GB", caps.total_ram_gb);
+            println!("GPU VRAM:           {:.2} GB", caps.vram_gb);
             println!("Estimated Compute:  {:.1} TFLOPS FP16", caps.estimated_tflops);
-            println!("Max 4-bit Model:    {:.1} Billion parameters", caps.max_hostable_parameters_4bit());
+            println!("Max 4-bit Capacity: {:.1} Billion parameters", caps.max_hostable_parameters_4bit());
+            if let Some(ref b) = bridge {
+                println!("GPU Local Bridge:   {}", b);
+            }
             println!("------------------------------------------------------------");
             println!("Seeding Model:      {}", model);
-            println!("Connecting to:      {}", tracker);
+            println!("Connecting Tracker: {}", tracker);
             println!("============================================================");
 
-            let worker = Arc::new(WorkerNode::new(model, tracker));
+            let worker = Arc::new(WorkerNode::new(model, tracker, bridge));
             worker.start().await;
         }
 
